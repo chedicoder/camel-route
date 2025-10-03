@@ -1,0 +1,29 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: camel-health
+  namespace: camel-k
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: camel-health
+  template:
+    metadata:
+      labels:
+        app: camel-health
+    spec:
+      containers:
+        - name: camel-health
+          image: chedi1/camel:1.0
+          imagePullPolicy: Never
+          ports:
+            - containerPort: 8080
+          volumeMounts:
+            - name: camel-config
+              mountPath: /deployments/application.properties
+              subPath: application.properties  
+      volumes:
+        - name: camel-config
+          configMap:
+            name: camel-health-config
