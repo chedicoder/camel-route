@@ -1,0 +1,223 @@
+image: $SHRD_HARBOR_URL/system/maven:3.8.5-openjdk-17
+
+variables:
+  MAVEN_OPTS: "-Dmaven.repo.local=.m2/repository"
+  MAVEN_CLI_OPTS: "-s ../.ci/ci_settings.xml -B --fail-fast -Dmaven.wagon.http.timeout=5000 -T 2C -Dmaven.wagon.http.ssl.insecure=true -Dmaven.wagon.http.ssl.allowall=true -Dmaven.resolver.transport=wagon"
+  PROJECT_NAME: "${CI_PROJECT_NAME}"
+  ENV_NAME: "$CI_COMMIT_REF_NAME"
+  KUBECONFIG: "/builds/${CI_PROJECT_NAMESPACE}/${CI_PROJECT_NAME}/kubeconfig"
+  IS_TEMPLATE: "false"
+  BASE_REPO_URL: "https://$GITLAB_MSIC_USERNAME:$GITLAB_MSIC_TOKEN@$SHRD_GITLAB_URL/sic-modernization"
+  PROJECT_RELATIF_PATH: "micro-services"
+  DEVTOOL_HARBOR_URL: "registry.devtool.iamdg.net.ma"
+
+.before-script-set-tag:
+  before_script:
+    - export DOCKER_IMAGE_VERSION=$CI_COMMIT_SHORT_SHA
+    - echo "🔹 Docker image tag = $DOCKER_IMAGE_VERSION"
+
+# --- Workflow ---
+workflow:
+  rules:
+    - if: '$CI_COMMIT_REF_NAME == "main"'
+      variables:
+          ENV_NAME: "dev"
+    - when: always
+
+cache:
+  key: ${CI_PROJECT_NAMESPACE}
+  paths:
+    - .m2/repository
+  policy: pull-push
+
+stages:
+  - initialize-pipeline
+  - fetch-config
+  - build
+  - kaniko-devtool
+  - deploy-to-env
+
+# --- Includes ---
+include:
+  - project: 'sic-modernization/devsecops/gitlab-ci-templates'
+    file: '/shared/maven/generate-settings.yml'
+    ref: main
+
+
+# --- Jobs ---
+fetch-config:
+  stage: fetch-config
+  image: $SHRD_HARBOR_URL/system/curlimages/curl:7.87.1 # Image Docker contenant curl
+  script:
+    - |
+
+      if [ "$ENV_NAME" == "dev" ]; then
+        MAPPED_ENV="main"
+      else
+        MAPPED_ENV="$ENV_NAME"
+      fi
+
+      # Utiliser curl avec --resolve pour simuler une entrée /etc/hosts
+      CONFIG_JSON=$(curl -v -s --insecure --resolve $DEV_CONFIG_SERVICE_URL:$DEV_CONFIG_SERVICE_PORT:$DEV_CONFIG_SERVICE_IP https://$DEV_CONFIG_SERVICE_URL/config-service/$PROJECT_NAME/k8s/$MAPPED_ENV)
+      
+      # Extraire uniquement les propriétés du premier source
+      echo "Extracting properties from propertySources..."
+      PROPERTIES=$(echo "$CONFIG_JSON" | jq -r '.propertySources[0].source | to_entries | map("\(.key)=\(.value)") | .[]')
+
+      # Créer le fichier ${PROJECT_NAME}-k8s.properties
+      echo "Creating ${PROJECT_NAME}-k8s.properties..."
+      echo "$PROPERTIES" > ${PROJECT_NAME}-k8s.properties
+      
+      # Vérifier le contenu du fichier
+      echo "Generated properties file:"
+      cat ${PROJECT_NAME}-k8s.properties
+
+  artifacts:
+    paths:
+      - ${PROJECT_NAME}-k8s.properties 
+  environment:
+    name: $ENV_NAME
+  only:
+    - main
+    - tst
+    - dm
+    - uat
+    - int
+
+       
+
+
+compile-and-package:
+  stage: build
+  extends: .generate-maven-settings-template
+  script:
+    - echo "cloning camel-k runtime repo"
+    - git -c http.sslVerify=false clone $BASE_REPO_URL/integration/camel/test camel-route
+    
+    - rm camel-route/src/main/resources/routes/hello.groovy
+    - cp ${PROJECT_NAME}.groovy camel-route/src/main/resources/routes/
+
+    - cat camel-route/src/main/resources/application.properties >> ${PROJECT_NAME}-k8s.properties 
+
+    - echo "🔹 Maven build - Compilation du projet Quarkus"
+    - cd camel-route
+    - mvn $MAVEN_CLI_OPTS clean package -Pk8s -DskipTests dependency:copy-dependencies
+
+  artifacts:
+    paths:
+      - camel-route/target/
+      - camel-route/target/libs/
+      - camel-route/Dockerfile
+      - camel-route/deployment.yaml
+      - ${PROJECT_NAME}-k8s.properties
+      
+    expire_in: 1 week
+  timeout: 4h
+
+build-docker-image:
+  stage: kaniko-devtool
+  image:
+    name: $SHRD_HARBOR_URL/system/docker/kaniko-project/executor:v1.14.0-debug
+    entrypoint: [ "" ]
+  script:
+  # Configuration de l'authentification Docker
+  - echo "{\"auths\":{\"$SHRD_HARBOR_URL\":{\"username\":\"$SHRD_HARBOR_USERNAME\",\"password\":\"$SHRD_HARBOR_PASSWORD\"}}}" > /kaniko/.docker/config.json
+  # Construction de l'image avec Kaniko
+  - mv camel-route/Dockerfile ./
+  - mkdir target
+  - cp -r camel-route/target/* target/
+  - /kaniko/executor --context $CI_PROJECT_DIR --dockerfile $CI_PROJECT_DIR/Dockerfile --no-push --destination $SHRD_HARBOR_URL/apps/msic/$PROJECT_NAME:${DOCKER_IMAGE_VERSION} --tar-path image-devtool.tar --skip-tls-verify-pull --skip-tls-verify-registry $SHRD_HARBOR_URL --skip-tls-verify-registry $DEVTOOL_HARBOR_URL
+  artifacts:
+    paths:
+    - image-devtool.tar
+    when: on_success
+  only:
+    - tst
+    - uat
+    - main
+    - dm
+    - int
+  environment:
+    name: $ENV_NAME
+
+
+push-docker-image:
+  stage: kaniko-devtool
+  image: $SHRD_HARBOR_URL/system/docker/kaniko-project/crane:debug
+  script:
+    - echo "Logging into Harbor registry..."
+    - crane auth login -u $SHRD_HARBOR_USERNAME -p $SHRD_HARBOR_PASSWORD $SHRD_HARBOR_URL --insecure
+
+    - echo "Pushing Docker image to registry..."
+    - crane push image-devtool.tar $SHRD_HARBOR_URL/apps/msic/$PROJECT_NAME:${DOCKER_IMAGE_VERSION} --insecure
+  needs:
+    - build-docker-image
+  environment:
+    name: $ENV_NAME
+  only:
+    - tst
+    - uat
+    - main
+    - dm
+    - int
+
+
+deploy-to-env:
+  stage: deploy-to-env
+  extends: .before-script-set-tag
+  image: $SHRD_HARBOR_URL/airgap/bitnami/kubectl:1.29.2-debian-12-r3
+  script:
+    - |
+      if [ "$ENV_NAME" == "dm" ]; then
+        echo "$DM_K8S_KUBE_CONFIG" > kubeconfig
+      elif [ "$ENV_NAME" == "tst" ]; then
+        echo "$TST_K8S_KUBE_CONFIG" > kubeconfig
+      elif [ "$ENV_NAME" == "dev" ]; then
+        echo "$DEV_K8S_KUBE_CONFIG" > kubeconfig
+
+      elif [ "$ENV_NAME" == "uat" ]; then
+        echo "$UAT_K8S_KUBE_CONFIG" > kubeconfig
+
+      elif [ "$ENV_NAME" == "int" ]; then
+        echo "$INT_K8S_KUBE_CONFIG" > kubeconfig
+        
+      else
+        echo "❌ Invalid ENV_NAME: '$ENV_NAME'. Aborting."
+        exit 1
+      fi
+
+    - chmod 600 kubeconfig
+    - export KUBECONFIG=kubeconfig
+    
+    - mv camel-route/deployment.yaml ./
+    # # metadata.name -> $PROJECT_NAME
+    - sed -i "/^metadata:/,/^spec:/ s/^\(\s*name:\s*\).*/\1test/" deployment.yaml
+
+    # # spec.selector.matchLabels.app -> $PROJECT_NAME
+    # # spec.template.metadata.labels.app -> $PROJECT_NAME
+    - sed -i "/^spec:/,/^template:/ s/^\(\s*app:\s*\).*/\1test/" deployment.yaml
+
+    # # spec.template.spec.containers.name -> $PROJECT_NAME
+    - sed -i "/containers:/,/image:/ s/^\(\s*-\s*name:\s*\).*/\1test/" deployment.yaml
+
+    # spec.template.spec.containers.image -> $SHRD_HARBOR_URL/camel-test/$PROJECT_NAME:$DOCKER_IMAGE_VERSION
+    - sed -i "/containers:/,/ports:/ s|^\(\s*image:\s*\).*|\1${SHRD_HARBOR_URL}/apps/msic/${PROJECT_NAME}:latest|" deployment.yaml
+    
+    # spec.template.spec.volumes.configMap.name → camel-route-config-$PROJECT_NAME
+    - sed -i "s/^\(\s*name:\s*\)camel-route-config$/\1camel-route-config-${PROJECT_NAME}/" deployment.yaml
+
+    - kubectl create configmap camel-route-config-$PROJECT_NAME --from-file=application.properties=${PROJECT_NAME}-k8s.properties -n msic-app --dry-run=client -o yaml | kubectl apply -f -
+    
+    - kubectl apply -f deployment.yaml 
+
+  environment:
+    name: $ENV_NAME
+
+  only:
+    - main
+    - tst
+    - dm
+    - uat
+    - int
+  
+

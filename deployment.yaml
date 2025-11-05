@@ -7,15 +7,15 @@ spec:
   replicas: 1
   selector:
     matchLabels:
-      app: camel-health
+      app: test
   template:
     metadata:
       labels:
-        app: camel-health
+        app: test
     spec:
       containers:
-        - name: camel-health
-          image: chedi1/camel:1.0
+        - name: testvv
+          image: docker/camel-test/test:1.0.0
           imagePullPolicy: Never
           ports:
             - containerPort: 8080
@@ -26,4 +26,6 @@ spec:
       volumes:
         - name: camel-config
           configMap:
-            name: camel-health-config
+            name: camel-route-config-
+
+
